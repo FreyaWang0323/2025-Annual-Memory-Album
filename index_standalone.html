@@ -1,0 +1,699 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>2025 Annual Memory Album</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: #020617; }
+      #root { width: 100%; height: 100%; }
+      ::-webkit-scrollbar { width: 6px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+      
+      .glow { text-shadow: 0 0 10px rgba(255,255,255,0.8), 0 0 20px rgba(100,200,255,0.4); font-weight: bold; }
+      @keyframes fadeInUp {
+          from { opacity: 0; transform: translateY(10px); }
+          to { opacity: 1; transform: translateY(0); }
+      }
+      .animate-fade-in-up {
+          animation: fadeInUp 0.3s ease-out forwards;
+      }
+    </style>
+    
+    <!-- Babel for on-the-fly JSX compilation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Import Map for dependencies -->
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "three": "https://esm.sh/three@0.160.0",
+        "@mediapipe/tasks-vision": "https://esm.sh/@mediapipe/tasks-vision@0.10.9",
+        "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.15.12?external=react,react-dom,three",
+        "@react-three/drei": "https://esm.sh/@react-three/drei@9.96.1?external=react,react-dom,three,@react-three/fiber",
+        "@react-three/postprocessing": "https://esm.sh/@react-three/postprocessing@2.16.0?external=react,react-dom,three,@react-three/fiber",
+        "postprocessing": "https://esm.sh/postprocessing@6.34.1?external=three",
+        "uuid": "https://esm.sh/uuid@9.0.1"
+      }
+    }
+    </script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module" data-presets="typescript,react">
+        import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+        import ReactDOM from 'react-dom/client';
+        import * as THREE from 'three';
+        import { Canvas, useFrame, useThree } from '@react-three/fiber';
+        import { Effects, Edges, useTexture, Stars, Sparkles } from '@react-three/drei';
+        import { EffectComposer, Bloom } from '@react-three/postprocessing';
+        import { FilesetResolver, HandLandmarker, DrawingUtils } from "@mediapipe/tasks-vision";
+
+        // --- TYPES ---
+        enum AppMode {
+            BROWSE = 'BROWSE',
+            FOCUS = 'FOCUS',
+            AGGREGATE = 'AGGREGATE',
+        }
+
+        // --- UTILS ---
+        const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
+        const lerp = (start, end, t) => start * (1 - t) + end * t;
+
+        class EMA {
+            constructor(alpha) {
+                this.alpha = alpha;
+                this.value = null;
+            }
+            update(newValue) {
+                if (this.value === null) {
+                    this.value = newValue;
+                } else {
+                    this.value = this.alpha * newValue + (1 - this.alpha) * this.value;
+                }
+                return this.value;
+            }
+            reset() {
+                this.value = null;
+            }
+        }
+
+        class VisionManager {
+            constructor() {
+                this.handLandmarker = null;
+            }
+            static getInstance() {
+                if (!VisionManager.instance) {
+                    VisionManager.instance = new VisionManager();
+                }
+                return VisionManager.instance;
+            }
+            async initialize() {
+                if (this.handLandmarker) return;
+                const vision = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm"
+                );
+                this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                        delegate: "GPU",
+                    },
+                    runningMode: "VIDEO",
+                    numHands: 1,
+                    minHandDetectionConfidence: 0.6,
+                    minHandPresenceConfidence: 0.6,
+                    minTrackingConfidence: 0.6,
+                });
+            }
+        }
+
+        const distance3D = (p1, p2) => {
+            return Math.sqrt(
+                Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2) + Math.pow(p1.z - p2.z, 2)
+            );
+        };
+
+        // --- COMPONENTS: Visuals3D ---
+        const MIN_RADIUS = 9.0;
+        const ITEM_ARC_SPACING = 1.6;
+
+        const getSpherePosition = (index, total, radius) => {
+            const phi = Math.acos(1 - 2 * (index + 0.5) / total);
+            const theta = Math.PI * (1 + 5 ** 0.5) * (index + 0.5);
+            const x = radius * Math.sin(phi) * Math.cos(theta);
+            const y = radius * Math.sin(phi) * Math.sin(theta);
+            const z = radius * Math.cos(phi);
+            return new THREE.Vector3(x, y, z);
+        };
+
+        const FrameMesh = ({ item, index, total, mode, scrollOffset, focusedId, frameScale, nebulaDensity, driftSpeed, browseSpacing, focusZoom }) => {
+            const meshRef = useRef(null);
+            const isFocused = mode === AppMode.FOCUS && item.id === focusedId;
+
+            useFrame((state, delta) => {
+                if (!meshRef.current) return;
+
+                const tPos = new THREE.Vector3();
+                const tRot = new THREE.Euler(0, 0, 0);
+                let tScale = frameScale;
+                const time = state.clock.elapsedTime;
+                
+                if (mode === AppMode.AGGREGATE) {
+                    const sphereRadius = 4.5 * nebulaDensity;
+                    const basePos = getSpherePosition(index, total, sphereRadius);
+                    const rotSpeed = driftSpeed; 
+                    const angle = time * rotSpeed;
+                    
+                    const rotatedX = basePos.x * Math.cos(angle) - basePos.z * Math.sin(angle);
+                    const rotatedZ = basePos.x * Math.sin(angle) + basePos.z * Math.cos(angle);
+                    
+                    tPos.set(rotatedX, basePos.y, rotatedZ);
+                    tRot.set(0, -angle + Math.atan2(basePos.x, basePos.z), 0); 
+                    tRot.x += Math.sin(time + index) * 0.1;
+                    tScale = 0.8; 
+                } else {
+                    const circumference = Math.max(total * ITEM_ARC_SPACING, MIN_RADIUS * 2 * Math.PI);
+                    const radius = circumference / (2 * Math.PI);
+                    const centerZ = radius + 1.5;
+
+                    const angleStep = (Math.PI * 2) / total;
+                    const theta = index * angleStep + scrollOffset;
+                    
+                    tPos.x = radius * Math.sin(theta);
+                    tPos.z = centerZ - radius * Math.cos(theta);
+                    tPos.y = Math.sin(index * 0.5 + time) * 0.2; 
+                    tRot.y = -theta; 
+
+                    if (mode === AppMode.FOCUS && item.id === focusedId) {
+                        tPos.set(0, 0, 2.2); 
+                        tRot.set(0, 0, 0); 
+                        tScale = frameScale * focusZoom; 
+                    }
+                }
+
+                let speed = 3.5;
+                if (mode === AppMode.FOCUS) speed = 5;
+                if (mode === AppMode.AGGREGATE) speed = 2.5;
+                
+                meshRef.current.position.lerp(tPos, delta * speed);
+                const targetQuat = new THREE.Quaternion().setFromEuler(tRot);
+                meshRef.current.quaternion.slerp(targetQuat, delta * speed);
+
+                let scaleX = 1;
+                let scaleY = 1;
+                if (item.aspectRatio > 1) {
+                    scaleY = 1 / item.aspectRatio;
+                } else {
+                    scaleX = item.aspectRatio;
+                }
+                
+                meshRef.current.scale.lerp(new THREE.Vector3(scaleX * tScale, scaleY * tScale, tScale), delta * speed);
+
+                if (item.type === 'VIDEO' && item.videoElement) {
+                    if (isFocused && mode === AppMode.FOCUS) {
+                        if (item.videoElement.paused) {
+                            const playPromise = item.videoElement.play();
+                            if (playPromise !== undefined) playPromise.catch(() => {});
+                        }
+                    } else {
+                        if (!item.videoElement.paused) item.videoElement.pause();
+                    }
+                }
+            });
+
+            const material = useMemo(() => {
+                if (item.type === 'EMPTY') {
+                    return new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.2, side: THREE.DoubleSide });
+                } else if (item.texture) {
+                    return new THREE.MeshBasicMaterial({ map: item.texture, color: 0xffffff, side: THREE.DoubleSide, toneMapped: false });
+                }
+                return new THREE.MeshBasicMaterial({ color: 0x111111 });
+            }, [item.type, item.texture]);
+
+            const borderColor = useMemo(() => {
+                if (isFocused) return new THREE.Color("#ffaa88").multiplyScalar(3); 
+                if (item.type === 'EMPTY') return new THREE.Color("#ff4444").multiplyScalar(1.2); 
+                return new THREE.Color("#aaaaaa").multiplyScalar(1.5);
+            }, [isFocused, item.type]);
+
+            return (
+                <mesh ref={meshRef}>
+                    <boxGeometry args={[1, 1, 0.05]} />
+                    <primitive object={material} attach="material" />
+                    <Edges scale={1.0} threshold={15} color={borderColor} />
+                    <mesh scale={[1.05, 1.05, 0.9]}>
+                        <planeGeometry />
+                        <meshBasicMaterial color={isFocused ? "#ffffff" : "#000000"} transparent opacity={isFocused ? 0.1 : 0.5} side={THREE.BackSide} />
+                    </mesh>
+                </mesh>
+            );
+        };
+
+        const SceneContent = (props) => {
+            const { scene } = useThree();
+            useEffect(() => {
+                scene.fog = new THREE.FogExp2('#2a0404', 0.05);
+                scene.background = new THREE.Color('#050101');
+            }, [scene]);
+
+            return (
+                <>
+                    <ambientLight intensity={0.1} />
+                    <pointLight position={[10, 10, 10]} intensity={1.5} color="#ff8866" />
+                    <pointLight position={[-10, -5, -5]} intensity={1.0} color="#cc4444" />
+                    <spotLight position={[0, 0, 8]} angle={0.5} penumbra={1} intensity={2} color="#fff0ee" />
+                    <Stars radius={100} depth={50} count={3000} factor={4} saturation={0} fade speed={0.5} />
+                    <Sparkles count={200} scale={20} size={2} speed={2.0} opacity={0.5} color="#ffccaa" />
+                    <group>
+                        {props.items.map((item, i) => (
+                            <FrameMesh key={item.id} index={i} total={props.items.length} item={item} {...props} />
+                        ))}
+                    </group>
+                    <EffectComposer enableNormalPass={false}>
+                        <Bloom luminanceThreshold={1.1} mipmapBlur intensity={0.6} radius={0.4} />
+                    </EffectComposer>
+                </>
+            );
+        };
+
+        const Visuals3D = (props) => {
+            return (
+                <Canvas 
+                    className="w-full h-full block" 
+                    camera={{ position: [0, 0, 5], fov: 50 }} 
+                    onClick={props.onFrameClick}
+                    dpr={[1, 2]} 
+                    gl={{ antialias: true, alpha: false, powerPreference: "high-performance", stencil: false, depth: true }}
+                >
+                    <SceneContent {...props} />
+                </Canvas>
+            );
+        };
+
+        // --- COMPONENTS: Overlay ---
+        const Overlay = ({ webcamVideoRef, canvasRef, mode, settings, setSettings, onUploadMedia, onClearMedia, onUploadMusic, musicPlaying, toggleMusic, permissionError, needsInteraction, isLoading }) => {
+            const [showSettings, setShowSettings] = useState(false);
+            const [showTips, setShowTips] = useState(false);
+            const [webcamCollapsed, setWebcamCollapsed] = useState(false);
+
+            const getModeLabel = () => {
+                switch(mode) {
+                    case AppMode.BROWSE: return "BROWSE";
+                    case AppMode.FOCUS: return "FOCUS";
+                    case AppMode.AGGREGATE: return "SPHERE";
+                    default: return "";
+                }
+            };
+
+            const getStatusColor = () => {
+                switch(mode) {
+                    case AppMode.FOCUS: return 'bg-green-400 shadow-[0_0_8px_#4ade80]';
+                    case AppMode.BROWSE: return 'bg-blue-400 shadow-[0_0_8px_#60a5fa]';
+                    case AppMode.AGGREGATE: return 'bg-purple-400 shadow-[0_0_8px_#d8b4fe]';
+                    default: return 'bg-white/50';
+                }
+            };
+
+            return (
+                <div className="absolute inset-0 pointer-events-none flex flex-col justify-between z-10 overflow-hidden">
+                    <div className="w-full p-8 flex justify-between items-start pointer-events-auto">
+                        <div className="relative select-none">
+                            <h1 className="text-5xl font-serif italic font-bold tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-red-100 via-white to-orange-200 drop-shadow-[0_0_15px_rgba(255,255,255,0.6)]">
+                                2025 Memory Album
+                            </h1>
+                            <div className="h-1 w-24 bg-gradient-to-r from-red-500 to-orange-500 mt-2 rounded-full opacity-80" />
+                        </div>
+                        <div className="flex flex-col items-end gap-3">
+                            <div className="flex gap-2 p-1 bg-white/5 backdrop-blur-md rounded-lg border border-white/10 shadow-lg transition-all hover:bg-white/10">
+                                <label className="cursor-pointer p-2 hover:bg-white/10 rounded transition-colors text-white text-xs font-semibold tracking-wide uppercase flex items-center justify-center w-8 h-8" title="Upload Media">
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                                    <input type="file" multiple accept="image/*,video/*" className="hidden" onChange={(e) => e.target.files && onUploadMedia(e.target.files)} />
+                                </label>
+                                <div className="w-[1px] bg-white/20 my-1"></div>
+                                <button onClick={onClearMedia} className="p-2 hover:bg-red-500/20 hover:text-red-200 text-white/80 rounded transition-colors text-xs font-semibold tracking-wide uppercase flex items-center justify-center w-8 h-8" title="Clear All">
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                </button>
+                            </div>
+                            <div className="flex gap-2 p-1 bg-white/5 backdrop-blur-md rounded-lg border border-white/10 shadow-lg transition-all hover:bg-white/10">
+                                <label className="cursor-pointer p-2 hover:bg-white/10 rounded transition-colors text-blue-200 text-xs font-semibold tracking-wide uppercase flex items-center justify-center w-8 h-8" title="Upload BGM">
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"></path></svg>
+                                    <input type="file" accept="audio/*" className="hidden" onChange={(e) => e.target.files && onUploadMusic(e.target.files[0])} />
+                                </label>
+                                <div className="w-[1px] bg-white/20 my-1"></div>
+                                <button onClick={toggleMusic} className={`p-2 rounded transition-colors text-xs font-semibold tracking-wide uppercase flex items-center justify-center w-8 h-8 ${musicPlaying ? 'text-green-300 bg-green-900/30' : 'text-white/60 hover:text-white'}`} title={musicPlaying ? "Pause" : "Play"}>
+                                    {musicPlaying ? (
+                                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd"></path></svg>
+                                    ) : (
+                                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd"></path></svg>
+                                    )}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    {needsInteraction && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-50 pointer-events-none">
+                            <div className="bg-white/5 backdrop-blur-xl p-8 rounded-xl border border-white/10 text-center shadow-[0_0_50px_rgba(0,0,0,0.5)]">
+                                {isLoading ? (
+                                    <div className="flex flex-col items-center animate-pulse">
+                                        <div className="text-2xl text-white font-serif italic tracking-widest mb-2">2025 Annual Memories Loading...</div>
+                                        <div className="text-xs text-white/50 font-mono">INITIALIZING VISION</div>
+                                    </div>
+                                ) : (
+                                    <div className="flex flex-col items-center animate-pulse">
+                                        <h2 className="text-3xl text-white font-serif italic mb-3 tracking-widest drop-shadow-lg">2025 Annual Memories</h2>
+                                        <div className="text-xs text-white/60 font-mono tracking-[0.2em] uppercase">Click Anywhere to Enter</div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {showSettings && <div className="absolute inset-0 bg-transparent z-40 pointer-events-auto" onClick={() => setShowSettings(false)} />}
+
+                    <div className="w-full p-8 flex justify-between items-end pointer-events-auto bg-gradient-to-t from-black/90 to-transparent z-50">
+                        <div className="flex flex-col items-start gap-4">
+                            <div className="relative">
+                                <button onClick={() => setShowSettings(!showSettings)} className={`p-2 rounded-full border border-white/20 transition-all shadow-lg backdrop-blur-md flex items-center justify-center w-10 h-10 ${showSettings ? 'bg-white text-black' : 'bg-white/10 text-white hover:bg-white/20'}`}>
+                                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                                </button>
+                                {showSettings && (
+                                    <div className="absolute bottom-full left-0 mb-3 bg-black/80 backdrop-blur-xl border border-white/10 p-4 rounded-lg text-white text-xs w-64 shadow-2xl animate-fade-in-up" onClick={(e) => e.stopPropagation()}>
+                                        <div className="font-bold text-white/90 uppercase tracking-widest border-b border-white/10 pb-1 mb-3">Preferences</div>
+                                        <div className="mb-4"><label className="block text-gray-400 mb-2 flex justify-between"><span>Frames Count</span> <span>{settings.slotCount}</span></label><input type="range" min="5" max="50" value={settings.slotCount} onChange={(e) => setSettings({...settings, slotCount: Number(e.target.value)})} className="w-full accent-white h-1 bg-white/20 rounded-lg appearance-none cursor-pointer"/></div>
+                                        <div className="mb-4"><label className="block text-gray-400 mb-2 flex justify-between"><span>Frame Size</span> <span>{settings.frameScale.toFixed(1)}x</span></label><input type="range" min="0.5" max="3.0" step="0.1" value={settings.frameScale} onChange={(e) => setSettings({...settings, frameScale: Number(e.target.value)})} className="w-full accent-white h-1 bg-white/20 rounded-lg appearance-none cursor-pointer"/></div>
+                                        <div className="mb-4"><label className="block text-gray-400 mb-2 flex justify-between"><span>Sphere Radius</span> <span>{settings.nebulaDensity.toFixed(1)}</span></label><input type="range" min="0.1" max="3.0" step="0.1" value={settings.nebulaDensity} onChange={(e) => setSettings({...settings, nebulaDensity: Number(e.target.value)})} className="w-full accent-white h-1 bg-white/20 rounded-lg appearance-none cursor-pointer"/></div>
+                                        <div className="mb-4"><label className="block text-gray-400 mb-2 flex justify-between"><span>Sphere Speed</span> <span>{settings.driftSpeed.toFixed(1)}</span></label><input type="range" min="0.0" max="2.0" step="0.1" value={settings.driftSpeed} onChange={(e) => setSettings({...settings, driftSpeed: Number(e.target.value)})} className="w-full accent-white h-1 bg-white/20 rounded-lg appearance-none cursor-pointer"/></div>
+                                        <div className="mb-4"><label className="block text-gray-400 mb-2 flex justify-between"><span>Browse Spacing</span> <span>{settings.browseSpacing.toFixed(2)}</span></label><input type="range" min="0.1" max="0.5" step="0.01" value={settings.browseSpacing} onChange={(e) => setSettings({...settings, browseSpacing: Number(e.target.value)})} className="w-full accent-white h-1 bg-white/20 rounded-lg appearance-none cursor-pointer"/></div>
+                                        <div className="mb-4"><label className="block text-gray-400 mb-2 flex justify-between"><span>Focus Zoom</span> <span>{settings.focusZoom.toFixed(1)}x</span></label><input type="range" min="1.0" max="2.5" step="0.1" value={settings.focusZoom} onChange={(e) => setSettings({...settings, focusZoom: Number(e.target.value)})} className="w-full accent-white h-1 bg-white/20 rounded-lg appearance-none cursor-pointer"/></div>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="flex items-center gap-3">
+                                <button onClick={() => setShowTips(!showTips)} className="flex items-center justify-center w-10 h-10 bg-white/10 hover:bg-white/20 backdrop-blur-md rounded-lg border border-white/20 transition-all text-white text-xs font-mono tracking-widest shadow-lg">
+                                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                </button>
+                                <div className="flex items-center gap-2 px-4 py-2 bg-black/40 backdrop-blur-md rounded-lg border border-white/10 text-white text-xs font-mono tracking-widest shadow-lg h-10">
+                                    <span className={`w-2 h-2 rounded-full ${getStatusColor()}`}></span>
+                                    {getModeLabel()}
+                                </div>
+                            </div>
+                            <div className={`overflow-hidden transition-all duration-300 ease-in-out bg-black/60 backdrop-blur-xl border border-white/10 rounded-lg shadow-2xl origin-top-left ${showTips ? 'max-h-64 opacity-100 p-4' : 'max-h-0 opacity-0 p-0 border-0'}`}>
+                                <div className="w-64 text-xs text-white/70 space-y-3">
+                                    <div className="font-bold text-white/90 uppercase tracking-widest border-b border-white/10 pb-1 mb-2">Gesture Guide</div>
+                                    <div className="flex justify-between items-center"><span>No Hand detected</span> <span className="text-purple-300">Sphere Mode</span></div>
+                                    <div className="flex justify-between items-center"><span>Relaxed Hand</span> <span className="text-purple-300">Sphere Mode</span></div>
+                                    <div className="flex justify-between items-center"><span>Open Palm</span> <span className="text-blue-300">Browse Mode</span></div>
+                                    <div className="flex justify-between items-center"><span>Pinch (Thumb+Index)</span> <span className="text-green-300">Focus & Play</span></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div className={`relative border border-white/20 rounded-lg overflow-hidden bg-black/80 shadow-[0_0_20px_rgba(255,255,255,0.1)] transition-all duration-300 ease-in-out ${webcamCollapsed ? 'w-32 h-8' : 'w-48 h-36'}`}>
+                            <button onClick={() => setWebcamCollapsed(!webcamCollapsed)} className="absolute top-0 right-0 z-20 p-1 text-white/50 hover:text-white bg-black/50 rounded-bl-lg">
+                                <svg className={`w-3 h-3 transform transition-transform ${webcamCollapsed ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                            </button>
+                            <div className={`w-full h-full transition-opacity duration-300 ${webcamCollapsed ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
+                                <video ref={webcamVideoRef} className="w-full h-full object-cover transform -scale-x-100 opacity-60" autoPlay playsInline muted />
+                                <canvas ref={canvasRef} className="absolute inset-0 w-full h-full transform -scale-x-100 opacity-80" />
+                            </div>
+                            <div className={`absolute inset-0 flex items-center justify-center text-[10px] text-white/50 font-mono tracking-tighter ${webcamCollapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>{permissionError ? "CAM ERROR" : "CAMERA"}</div>
+                            <div className={`absolute bottom-0 inset-x-0 bg-black/50 backdrop-blur-sm p-1 text-[10px] text-center text-white/50 font-mono tracking-tighter transition-opacity ${webcamCollapsed ? 'opacity-0' : 'opacity-100'}`}>{permissionError ? "CAM ERROR" : "VISION ON"}</div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- COMPONENTS: App ---
+        const INITIAL_SLOTS = 20;
+
+        function App() {
+            const [mode, setMode] = useState(AppMode.AGGREGATE);
+            const [settings, setSettings] = useState({ 
+                slotCount: INITIAL_SLOTS, 
+                frameScale: 1.8, 
+                nebulaDensity: 1.0, 
+                driftSpeed: 0.2,    
+                browseSpacing: 0.22, 
+                focusZoom: 1.3       
+            });
+            const [items, setItems] = useState([]);
+            const [scrollOffset, setScrollOffset] = useState(0);
+            const [focusedId, setFocusedId] = useState(null);
+            const [permissionError, setPermissionError] = useState(false);
+            const [needsInteraction, setNeedsInteraction] = useState(true);
+            const [musicPlaying, setMusicPlaying] = useState(false);
+            const [isLoading, setIsLoading] = useState(true);
+
+            const videoRef = useRef(null);
+            const canvasRef = useRef(null);
+            const audioRef = useRef(new Audio());
+            const requestRef = useRef(null);
+            const lastHandTime = useRef(0);
+            const handX_EMA = useRef(new EMA(0.1)); 
+            const pinchSmoother = useRef(new EMA(0.2));
+            const openPalmSmoother = useRef(new EMA(0.2));
+
+            useEffect(() => {
+                const newItems = [];
+                for (let i = 0; i < settings.slotCount; i++) {
+                    if (items[i]) {
+                        newItems.push(items[i]);
+                    } else {
+                        newItems.push({
+                            id: `slot-${Date.now()}-${i}`,
+                            type: 'EMPTY',
+                            aspectRatio: 1.0 
+                        });
+                    }
+                }
+                if (newItems.length > settings.slotCount) {
+                    newItems.length = settings.slotCount;
+                }
+                setItems(newItems);
+            }, [settings.slotCount]);
+
+            const startCamera = async () => {
+                if (!videoRef.current) return;
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                    videoRef.current.srcObject = stream;
+                    videoRef.current.addEventListener("loadeddata", predictWebcam);
+                } catch (e) {
+                    console.error("Camera denied:", e);
+                    setPermissionError(true);
+                }
+            };
+
+            useEffect(() => {
+                const initVision = async () => {
+                    try {
+                        const vm = VisionManager.getInstance();
+                        await vm.initialize();
+                        await startCamera();
+                        setIsLoading(false);
+                    } catch (e) {
+                        console.error("Vision init failed:", e);
+                        setPermissionError(true);
+                        setIsLoading(false);
+                    }
+                };
+                initVision();
+            }, []);
+
+            const predictWebcam = useCallback(() => {
+                const video = videoRef.current;
+                const canvas = canvasRef.current;
+                const vm = VisionManager.getInstance();
+
+                if (!video || !canvas || !vm.handLandmarker) return;
+
+                const ctx = canvas.getContext("2d");
+                if (!ctx) return;
+
+                const startTimeMs = performance.now();
+                let results;
+                try {
+                    if (video.currentTime > 0) {
+                        results = vm.handLandmarker.detectForVideo(video, startTimeMs);
+                    }
+                } catch (e) { console.warn(e) }
+
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                
+                if (results && results.landmarks.length > 0) {
+                    const landmarks = results.landmarks[0]; 
+                    lastHandTime.current = Date.now();
+                    
+                    const drawingUtils = new DrawingUtils(ctx);
+                    drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, { color: "#ff2244", lineWidth: 2 });
+                    drawingUtils.drawLandmarks(landmarks, { color: "#ffffff", radius: 1, lineWidth: 0 });
+                    
+                    processGestures(landmarks);
+
+                } else {
+                    if (Date.now() - lastHandTime.current > 500) { 
+                        setMode(prev => prev !== AppMode.AGGREGATE ? AppMode.AGGREGATE : prev);
+                        handX_EMA.current.reset();
+                    }
+                }
+
+                requestRef.current = requestAnimationFrame(predictWebcam);
+            }, []);
+
+            const processGestures = (landmarks) => {
+                const thumbTip = landmarks[4];
+                const indexTip = landmarks[8];
+                const middleMCP = landmarks[9];
+                
+                const pinchDist = distance3D(thumbTip, indexTip);
+                const isPinchingRaw = pinchDist < 0.06 ? 1 : 0; 
+                const pinchVal = pinchSmoother.current.update(isPinchingRaw);
+                const isPinchActive = pinchVal > 0.6; 
+
+                const wrist = landmarks[0];
+                const tips = [8, 12, 16, 20];
+                const pips = [6, 10, 14, 18];
+                let extendedCount = 0;
+                for(let i=0; i<tips.length; i++) {
+                    const dTip = distance3D(wrist, landmarks[tips[i]]);
+                    const dPip = distance3D(wrist, landmarks[pips[i]]);
+                    if (dTip > dPip * 1.1) extendedCount++;
+                }
+                
+                const isOpenRaw = extendedCount >= 3 ? 1 : 0;
+                const openVal = openPalmSmoother.current.update(isOpenRaw);
+                const isOpenActive = openVal > 0.6;
+
+                setMode((currentMode) => {
+                    if (isPinchActive) return AppMode.FOCUS;
+                    if (currentMode === AppMode.FOCUS) {
+                        if (pinchVal < 0.4) return isOpenActive ? AppMode.BROWSE : AppMode.AGGREGATE;
+                        return AppMode.FOCUS; 
+                    }
+                    if (isOpenActive) return AppMode.BROWSE;
+                    return AppMode.AGGREGATE;
+                });
+
+                const smoothedX = handX_EMA.current.update(middleMCP.x);
+                setMode(currentMode => {
+                    if (currentMode === AppMode.BROWSE) {
+                        const delta = smoothedX - 0.5;
+                        setScrollOffset(prev => prev + delta * 0.15); 
+                    }
+                    return currentMode;
+                });
+            };
+
+            useEffect(() => {
+                if (items.length === 0) return;
+                const angleStep = (Math.PI * 2) / items.length;
+                const rawIndex = Math.round(-scrollOffset / angleStep);
+                const len = items.length;
+                const wrappedIndex = ((rawIndex % len) + len) % len;
+                if (items[wrappedIndex]) setFocusedId(items[wrappedIndex].id);
+            }, [scrollOffset, items]);
+
+            const handleMediaUpload = (files) => {
+                setNeedsInteraction(false);
+                const newFiles = Array.from(files);
+                setItems(prevItems => {
+                    const nextItems = [...prevItems];
+                    let fileIdx = 0;
+                    for (let i = 0; i < nextItems.length && fileIdx < newFiles.length; i++) {
+                        if (nextItems[i].type === 'EMPTY') {
+                            const file = newFiles[fileIdx];
+                            const url = URL.createObjectURL(file);
+                            const isVideo = file.type.startsWith('video');
+                            const type = isVideo ? 'VIDEO' : 'IMAGE';
+                            nextItems[i] = { ...nextItems[i], type: type, url: url, aspectRatio: 1 };
+
+                            if (type === 'IMAGE') {
+                                const img = new Image();
+                                img.src = url;
+                                const id = nextItems[i].id;
+                                img.onload = () => {
+                                    const texture = new THREE.Texture(img);
+                                    texture.needsUpdate = true;
+                                    texture.colorSpace = THREE.SRGBColorSpace;
+                                    setItems(current => current.map(item => {
+                                        if (item.id === id) return { ...item, texture, aspectRatio: img.width / img.height };
+                                        return item;
+                                    }));
+                                };
+                            } else {
+                                const videoEl = document.createElement('video');
+                                videoEl.src = url;
+                                videoEl.muted = true;
+                                videoEl.loop = true;
+                                videoEl.playsInline = true;
+                                videoEl.crossOrigin = "anonymous";
+                                const id = nextItems[i].id;
+                                videoEl.onloadedmetadata = () => {
+                                    const texture = new THREE.VideoTexture(videoEl);
+                                    texture.colorSpace = THREE.SRGBColorSpace;
+                                    setItems(current => current.map(item => {
+                                        if (item.id === id) return { ...item, texture, videoElement: videoEl, aspectRatio: videoEl.videoWidth / videoEl.videoHeight };
+                                        return item;
+                                    }));
+                                }
+                            }
+                            fileIdx++;
+                        }
+                    }
+                    return nextItems;
+                });
+            };
+
+            const handleClearMedia = () => {
+                setItems(prev => prev.map(item => ({ ...item, type: 'EMPTY', url: undefined, texture: undefined, videoElement: undefined, aspectRatio: 1.0 })));
+            };
+
+            const handleMusicUpload = (file) => {
+                setNeedsInteraction(false);
+                const url = URL.createObjectURL(file);
+                audioRef.current.src = url;
+                audioRef.current.loop = true;
+                audioRef.current.play().then(() => setMusicPlaying(true)).catch(() => setMusicPlaying(false));
+            };
+
+            const toggleMusic = () => {
+                setNeedsInteraction(false);
+                if (audioRef.current.paused) {
+                    audioRef.current.play().then(() => setMusicPlaying(true));
+                } else {
+                    audioRef.current.pause();
+                    setMusicPlaying(false);
+                }
+            };
+
+            const handleGlobalClick = () => {
+                setNeedsInteraction(false);
+                if (musicPlaying && audioRef.current.paused) audioRef.current.play();
+            };
+
+            return (
+                <div className="relative w-full h-full bg-slate-950" onClick={handleGlobalClick}>
+                    <Visuals3D 
+                        items={items}
+                        mode={mode}
+                        scrollOffset={scrollOffset}
+                        focusedId={focusedId}
+                        frameScale={settings.frameScale}
+                        nebulaDensity={settings.nebulaDensity}
+                        driftSpeed={settings.driftSpeed}
+                        browseSpacing={settings.browseSpacing}
+                        focusZoom={settings.focusZoom}
+                        onFrameClick={handleGlobalClick}
+                    />
+                    <Overlay 
+                        webcamVideoRef={videoRef}
+                        canvasRef={canvasRef}
+                        mode={mode}
+                        settings={settings}
+                        setSettings={setSettings}
+                        onUploadMedia={handleMediaUpload}
+                        onClearMedia={handleClearMedia}
+                        onUploadMusic={handleMusicUpload}
+                        musicPlaying={musicPlaying}
+                        toggleMusic={toggleMusic}
+                        permissionError={permissionError}
+                        needsInteraction={needsInteraction}
+                        isLoading={isLoading}
+                    />
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+    

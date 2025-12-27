@@ -1,0 +1,7 @@
+{
+  "name": "2025 Annual Memory Album",
+  "description": "A 3D cinematic memory gallery controlled by hand gestures using MediaPipe and Three.js.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
