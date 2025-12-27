@@ -31,9 +31,7 @@
     {
       "imports": {
         "react": "https://esm.sh/react@18.2.0",
-        "react/jsx-runtime": "https://esm.sh/react@18.2.0/jsx-runtime",
-        "react/jsx-dev-runtime": "https://esm.sh/react@18.2.0/jsx-dev-runtime",
-        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",    
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
         "three": "https://esm.sh/three@0.160.0",
         "@mediapipe/tasks-vision": "https://esm.sh/@mediapipe/tasks-vision@0.10.9",
         "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.15.12?external=react,react-dom,three",
@@ -58,11 +56,12 @@
         import { FilesetResolver, HandLandmarker, DrawingUtils } from "@mediapipe/tasks-vision";
 
         // --- TYPES ---
-        enum AppMode {
-            BROWSE = 'BROWSE',
-            FOCUS = 'FOCUS',
-            AGGREGATE = 'AGGREGATE',
-        }
+        // Simulating Enum
+        const AppMode = {
+            BROWSE: 'BROWSE',
+            FOCUS: 'FOCUS',
+            AGGREGATE: 'AGGREGATE',
+        };
 
         // --- UTILS ---
         const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
@@ -698,4 +697,3 @@
     </script>
 </body>
 </html>
-    
